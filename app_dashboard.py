@@ -496,6 +496,19 @@ def render_tab(tab, name, res_data, dt, isafe, risk_arr, dates):
             )
             return
 
+        # KPI phải được suy ra từ chính lịch giao dịch đang hiển thị.
+        # Không dùng biến nhị phân phụ y_t làm nguồn hiển thị vì người dùng
+        # đang kiểm tra số lệnh thực tế thông qua Q_t và R_t.
+        transaction_epsilon = 1e-6
+        order_count = sum(
+            1 for q in q_vals
+            if q is not None and q > transaction_epsilon
+        )
+        arrival_count = sum(
+            1 for r in r_vals
+            if r is not None and r > transaction_epsilon
+        )
+
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "Tổng Chi Phí",
@@ -506,12 +519,12 @@ def render_tab(tab, name, res_data, dt, isafe, risk_arr, dates):
             )
         )
         c2.metric(
-            "Số Lần Gọi Điện",
-            f"{orders:,.0f} chuyến"
+            "Số Lệnh Đặt Mua",
+            f"{order_count} chuyến"
         )
         c3.metric(
             "Số Lần Hàng Tới Bến",
-            f"{sum(1 for r in r_vals if r > 0)} chuyến"
+            f"{arrival_count} chuyến"
         )
 
         df_plot = pd.DataFrame({
