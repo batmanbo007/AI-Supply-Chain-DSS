@@ -58,15 +58,25 @@ def solve_milp_single_material(name, D_t, I_safe, I_0, C_o, C_h, I_max, base_lea
         return False, 0, 0, [], [], [], []
         
     total_cost = pulp.value(model.objective)
-    orders = sum(y[t].varValue for t in days)
-    Q_vals = [Q[t].varValue for t in days]
-    I_vals = [I[t].varValue for t in days]
+
+    # Lấy kế hoạch đặt hàng thực tế từ Q_t.
+    # Dùng Q_t làm nguồn chuẩn để KPI "số lần mua" luôn khớp với bảng/biểu đồ.
+    # Ngưỡng nhỏ tránh đếm các sai số số học rất nhỏ của solver.
+    ORDER_EPSILON = 1e-6
+    Q_vals = [float(Q[t].varValue or 0.0) for t in days]
+    orders = sum(1 for q in Q_vals if q > ORDER_EPSILON)
+
+    I_vals = [float(I[t].varValue or 0.0) for t in days]
     
     # Rút trích Hàng Về và Thời gian Trễ để báo cáo
     R_vals = []
     L_vals = []
     for d in days:
-        received = sum(Q[t].varValue for t in days if t + L[t] == d)
+        received = sum(
+            float(Q[t].varValue or 0.0)
+            for t in days
+            if t + L[t] == d
+        )
         R_vals.append(received)
         L_vals.append(L[d])
         
