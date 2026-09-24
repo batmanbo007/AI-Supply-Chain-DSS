@@ -11,6 +11,7 @@ from layer3_optimization import solve_milp_single_material
 
 DEMAND_FILE = "D_t_forecast_7days.csv"
 WEATHER_FILE = "Weather_Forecast_7days.csv"
+APP_BUILD = "aligned-horizon-kpi-v3"
 
 
 # ==========================================
@@ -19,6 +20,7 @@ WEATHER_FILE = "Weather_Forecast_7days.csv"
 st.set_page_config(page_title="AI Supply Chain DSS", layout="wide")
 st.title("🌪️ HỆ THỐNG QUẢN TRỊ CHUỖI CUNG ỨNG LAI (ML-FUZZY-MILP)")
 st.markdown("*Tích hợp AI Dự báo Rủi ro Thời tiết & Tối ưu hóa Thời gian chờ động*")
+st.caption(f"Build: {APP_BUILD}")
 
 
 def load_aligned_inputs():
@@ -496,37 +498,9 @@ def render_tab(tab, name, res_data, dt, isafe, risk_arr, dates):
             )
             return
 
-        # KPI phải được suy ra từ chính lịch giao dịch đang hiển thị.
-        # Không dùng biến nhị phân phụ y_t làm nguồn hiển thị vì người dùng
-        # đang kiểm tra số lệnh thực tế thông qua Q_t và R_t.
-        transaction_epsilon = 1e-6
-        order_count = sum(
-            1 for q in q_vals
-            if q is not None and q > transaction_epsilon
-        )
-        arrival_count = sum(
-            1 for r in r_vals
-            if r is not None and r > transaction_epsilon
-        )
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric(
-            "Tổng Chi Phí",
-            (
-                f"{(cost % 1e9):,.0f} đ"
-                if cost < 1e9
-                else "RẤT LỚN (Phạt thiếu hàng)"
-            )
-        )
-        c2.metric(
-            "Số Lệnh Đặt Mua",
-            f"{order_count} chuyến"
-        )
-        c3.metric(
-            "Số Lần Hàng Tới Bến",
-            f"{arrival_count} chuyến"
-        )
-
+        # Tạo đúng bảng hiển thị trước, sau đó tính KPI trực tiếp từ
+        # chính các cột giao dịch của bảng này. Như vậy KPI và bảng không thể
+        # dùng hai nguồn dữ liệu khác nhau.
         df_plot = pd.DataFrame({
             "Ngày": dates,
             "Nhu Cầu ($D_t$)": dt,
@@ -539,6 +513,45 @@ def render_tab(tab, name, res_data, dt, isafe, risk_arr, dates):
             "Hàng CẬP BẾN ($R_t$)": r_vals,
             "Tồn Thực Tế ($I_t$)": i_vals,
         })
+
+        transaction_epsilon = 1e-6
+        q_display = pd.to_numeric(
+            df_plot["Lệnh GỌI MUA ($Q_t$)"],
+            errors="coerce"
+        ).fillna(0.0)
+        r_display = pd.to_numeric(
+            df_plot["Hàng CẬP BẾN ($R_t$)"],
+            errors="coerce"
+        ).fillna(0.0)
+
+        order_count = int((q_display.abs() > transaction_epsilon).sum())
+        arrival_count = int((r_display.abs() > transaction_epsilon).sum())
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Tổng Chi Phí",
+            (
+                f"{(cost % 1e9):,.0f} đ"
+                if cost < 1e9
+                else "RẤT LỚN (Phạt thiếu hàng)"
+            )
+        )
+        c2.metric(
+            "Số Lệnh Đặt Mua (Q_t > 0)",
+            f"{order_count} chuyến"
+        )
+        c3.metric(
+            "Số Lần Hàng Tới Bến (R_t > 0)",
+            f"{arrival_count} chuyến"
+        )
+
+        # Kiểm tra nội bộ: nếu giá trị solver trả về khác KPI suy từ bảng,
+        # dashboard vẫn ưu tiên bảng và phát cảnh báo để dễ debug.
+        if int(orders) != order_count:
+            st.warning(
+                f"⚠️ KPI solver ({int(orders)}) khác số lệnh đang hiển thị "
+                f"({order_count}). Dashboard dùng số từ Q_t hiển thị."
+            )
 
         st.dataframe(
             df_plot.style.format(
