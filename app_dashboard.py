@@ -1,258 +1,633 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import joblib
-import requests
-from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-# Import các hàm lõi từ Lớp 2 và Lớp 3
+from fetch_real_weather import get_real_weather_7_days
 from layer2_fuzzy_logic import build_fuzzy_system_thesis
 from layer3_optimization import solve_milp_single_material
 
+
+DEMAND_FILE = "D_t_forecast_7days.csv"
+WEATHER_FILE = "Weather_Forecast_7days.csv"
+
+
 # ==========================================
-# 1. CẤU HÌNH GIAO DIỆN & ĐỒNG BỘ THỜI GIAN THỰC
+# 1. CẤU HÌNH GIAO DIỆN & NẠP ALIGNED HORIZON
 # ==========================================
 st.set_page_config(page_title="AI Supply Chain DSS", layout="wide")
 st.title("🌪️ HỆ THỐNG QUẢN TRỊ CHUỖI CUNG ỨNG LAI (ML-FUZZY-MILP)")
 st.markdown("*Tích hợp AI Dự báo Rủi ro Thời tiết & Tối ưu hóa Thời gian chờ động*")
+
+
+def load_aligned_inputs():
+    """
+    Dashboard không tự sinh ngày.
+    Nó chỉ chạy khi Demand Forecast và Weather Forecast có đúng cùng 7 ngày.
+    """
+    try:
+        demand = pd.read_csv(DEMAND_FILE)
+        weather = pd.read_csv(WEATHER_FILE)
+    except FileNotFoundError as exc:
+        st.error(
+            f"❌ Thiếu file đầu vào: {exc.filename}. "
+            "Hãy chạy main_pipeline.py trước."
+        )
+        st.stop()
+    except Exception as exc:
+        st.error(f"❌ Không thể đọc dữ liệu pipeline: {exc}")
+        st.stop()
+
+    required_demand_cols = {
+        "Ngay", "Dùng_Than", "Dùng_C.Đốt", "Dùng_Carbon"
+    }
+    required_weather_cols = {
+        "Ngay", "Nhiet_Do_C", "Luong_Mua_mm", "Suc_Gio_kmh", "Bao"
+    }
+
+    missing_demand = required_demand_cols - set(demand.columns)
+    missing_weather = required_weather_cols - set(weather.columns)
+
+    if missing_demand:
+        st.error(
+            "❌ Demand Forecast thiếu cột: "
+            + ", ".join(sorted(missing_demand))
+        )
+        st.stop()
+
+    if missing_weather:
+        st.error(
+            "❌ Weather Forecast thiếu cột: "
+            + ", ".join(sorted(missing_weather))
+        )
+        st.stop()
+
+    demand["Ngay"] = pd.to_datetime(demand["Ngay"]).dt.normalize()
+    weather["Ngay"] = pd.to_datetime(weather["Ngay"]).dt.normalize()
+
+    if len(demand) != 7 or len(weather) != 7:
+        st.error(
+            "❌ Demand Forecast và Weather Forecast phải có đúng 7 ngày. "
+            "Hãy chạy lại main_pipeline.py."
+        )
+        st.stop()
+
+    if demand["Ngay"].duplicated().any() or weather["Ngay"].duplicated().any():
+        st.error("❌ Phát hiện ngày trùng lặp trong dữ liệu pipeline.")
+        st.stop()
+
+    demand_dates = pd.DatetimeIndex(demand["Ngay"])
+    weather_dates = pd.DatetimeIndex(weather["Ngay"])
+
+    if not demand_dates.equals(weather_dates):
+        st.error(
+            "❌ Demand Forecast và Weather Forecast không cùng khoảng ngày. "
+            "Dashboard dừng để tránh ra quyết định trên dữ liệu lệch thời gian."
+        )
+        st.stop()
+
+    try:
+        aligned = demand.merge(
+            weather,
+            on="Ngay",
+            how="inner",
+            validate="one_to_one"
+        )
+    except Exception as exc:
+        st.error(f"❌ Không thể ghép Demand và Weather theo ngày: {exc}")
+        st.stop()
+
+    if len(aligned) != 7:
+        st.error("❌ Sau khi merge theo Ngay không còn đủ 7 ngày.")
+        st.stop()
+
+    return demand, weather, aligned
+
+
+def weather_to_ui_frame(weather_df):
+    ui = weather_df[
+        ["Ngay", "Nhiet_Do_C", "Luong_Mua_mm", "Suc_Gio_kmh", "Bao"]
+    ].copy()
+
+    ui["Ngay"] = pd.to_datetime(ui["Ngay"]).dt.strftime("%Y-%m-%d")
+
+    return ui.rename(columns={
+        "Ngay": "Ngày",
+        "Nhiet_Do_C": "Nhiệt Độ (C)",
+        "Luong_Mua_mm": "Lượng Mưa (mm)",
+        "Suc_Gio_kmh": "Sức Gió (km/h)",
+        "Bao": "Có Bão (1/0)",
+    })
+
+
+df_demand, df_weather, df_aligned = load_aligned_inputs()
+
+forecast_dates = df_aligned["Ngay"].tolist()
+display_dates = [
+    date.strftime("%Y-%m-%d")
+    for date in forecast_dates
+]
+
+st.info(
+    "📅 **Decision Horizon:** "
+    f"{forecast_dates[0].strftime('%d/%m/%Y')} → "
+    f"{forecast_dates[-1].strftime('%d/%m/%Y')} · "
+    "Demand và Weather đã được đồng bộ 1:1 theo ngày."
+)
 st.markdown("---")
 
-# TỰ ĐỘNG SINH 7 NGÀY THỰC TẾ (Bắt đầu từ hôm nay)
-today = datetime.now()
-dates = [(today + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
-
-# Tải Dữ liệu Lớp 1 (Giữ nguyên toàn vẹn dữ liệu gốc)
-try:
-    df_ml = pd.read_csv("D_t_forecast_7days.csv")
-    ml_dates = df_ml['Ngay'].tolist() # Ngày gốc từ lịch sử ML
-    dt_than, dt_cd, dt_cb = df_ml['Dùng_Than'].tolist(), df_ml['Dùng_C.Đốt'].tolist(), df_ml['Dùng_Carbon'].tolist()
-except Exception:
-    st.error("❌ Lỗi: Không tìm thấy 'D_t_forecast_7days.csv'.")
-    st.stop()
+dt_than = df_aligned["Dùng_Than"].tolist()
+dt_cd = df_aligned["Dùng_C.Đốt"].tolist()
+dt_cb = df_aligned["Dùng_Carbon"].tolist()
 
 try:
     weather_ai = joblib.load("weather_risk_model.pkl")
-except Exception:
-    st.error("❌ Lỗi: Không tìm thấy 'weather_risk_model.pkl'.")
+except Exception as exc:
+    st.error(f"❌ Không thể tải 'weather_risk_model.pkl': {exc}")
     st.stop()
 
+
 # ==========================================
-# 2.5. ĐIỀU ĐỘ NĂNG SUẤT DÂY CHUYỀN
+# 2. ĐIỀU ĐỘ NĂNG SUẤT DÂY CHUYỀN
 # ==========================================
 st.sidebar.header("🏭 ĐIỀU ĐỘ SẢN XUẤT")
-st.sidebar.info("Kéo thanh trượt để phân bổ linh hoạt công suất. (Mặc định hệ thống AI dự báo ở mốc Tổng 100%)")
+st.sidebar.info(
+    "Kéo thanh trượt để phân bổ linh hoạt công suất. "
+    "(Mặc định hệ thống AI dự báo ở mốc Tổng 100%)"
+)
 
-# Thay nút gạt (Toggle) bằng Thanh trượt (Slider) linh hoạt từ 0% đến 150%
-cap_line1 = st.sidebar.slider("🟢 Công suất Dây chuyền 1 (%)", min_value=0, max_value=150, value=60, step=10)
-cap_line2 = st.sidebar.slider("🟢 Công suất Dây chuyền 2 (%)", min_value=0, max_value=150, value=40, step=10)
+cap_line1 = st.sidebar.slider(
+    "🟢 Công suất Dây chuyền 1 (%)",
+    min_value=0,
+    max_value=150,
+    value=60,
+    step=10
+)
+cap_line2 = st.sidebar.slider(
+    "🟢 Công suất Dây chuyền 2 (%)",
+    min_value=0,
+    max_value=150,
+    value=40,
+    step=10
+)
 
-# Hiển thị tổng công suất để kiểm soát
 total_cap = cap_line1 + cap_line2
 st.sidebar.markdown(f"**🔥 Tổng công suất thực tế:** `{total_cap}%`")
 
-# Hàm tính toán lại Nhu cầu thực tế dựa trên Tỷ lệ Slider
+
 def calculate_actual_demand(dt_list, c1, c2):
-    # Tính tổng hệ số (Ví dụ: 100% + 100% = 2.0)
     total_ratio = (c1 + c2) / 100.0
     return [d * total_ratio for d in dt_list]
 
-# Áp dụng nội suy tiêu thụ mới
+
 dt_than_actual = calculate_actual_demand(dt_than, cap_line1, cap_line2)
 dt_cd_actual = calculate_actual_demand(dt_cd, cap_line1, cap_line2)
 dt_cb_actual = calculate_actual_demand(dt_cb, cap_line1, cap_line2)
 
-# ==========================================
-# 2. HÀM GỌI API THỜI TIẾT THỰC TẾ
-# ==========================================
-def fetch_api_weather():
-    url = "https://api.open-meteo.com/v1/forecast?latitude=20.95&longitude=107.08&daily=temperature_2m_max,rain_sum,windspeed_10m_max&timezone=Asia%2FHo_Chi_Minh"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        data = res.json()['daily']
-        
-        api_dates = data['time'] # ĐÂY LÀ THỜI GIAN THỰC TẾ (REAL-TIME) TỪ VỆ TINH
-        
-        df = pd.DataFrame({
-            'Ngày': api_dates, 
-            'Nhiệt Độ (C)': np.round(data['temperature_2m_max'], 1),
-            'Lượng Mưa (mm)': np.round(data['rain_sum'], 1),
-            'Sức Gió (km/h)': np.round(data['windspeed_10m_max'], 1)
-        })
-        df['Có Bão (1/0)'] = ((df['Lượng Mưa (mm)'] > 100) & (df['Sức Gió (km/h)'] > 50)).astype(int)
-        return df
-    except Exception as e:
-        st.error(f"Lỗi API: {e}")
-        return None
-
-# Khởi tạo mặc định nếu chưa bấm nút (Dùng tạm ngày của ML)
-if 'weather_data' not in st.session_state:
-    st.session_state.weather_data = pd.DataFrame({
-        'Ngày': ml_dates,
-        'Nhiệt Độ (C)': [30.0, 29.5, 28.0, 25.0, 24.0, 27.0, 29.0],
-        'Lượng Mưa (mm)': [0.0, 10.0, 30.0, 180.0, 200.0, 20.0, 0.0],
-        'Sức Gió (km/h)': [12.0, 15.0, 25.0, 85.0, 90.0, 30.0, 10.0],
-        'Có Bão (1/0)': [0, 0, 0, 1, 1, 0, 0]
-    })
 
 # ==========================================
-# 3. CỘT BÊN TRÁI: BẢNG ĐIỀU KHIỂN LOGISTICS
+# 3. THÔNG SỐ LOGISTICS & KHO BÃI
 # ==========================================
 st.sidebar.header("⚙️ THÔNG SỐ LOGISTICS & KHO BÃI")
 
 with st.sidebar.expander("⚫ 1. KHO THAN", expanded=True):
-    i0_than = st.number_input("Tồn kho Than (I_0):", min_value=0, max_value=50000, value=3000, step=500)
-    # THÊM MỚI: Lựa chọn Phương tiện vận tải và Thời gian trễ
-    transport_than = st.selectbox("Phương tiện vận tải (Than):", ["Xà lan (Đường thủy)", "Xe tải (Đường bộ)"])
+    i0_than = st.number_input(
+        "Tồn kho Than (I_0):",
+        min_value=0,
+        max_value=50000,
+        value=3000,
+        step=500
+    )
+    transport_than = st.selectbox(
+        "Phương tiện vận tải (Than):",
+        ["Xà lan (Đường thủy)", "Xe tải (Đường bộ)"]
+    )
     lt_than = 3 if "Xà lan" in transport_than else 1
     st.caption(f"Thời gian chờ gốc (Lead time): **{lt_than} ngày**")
-    
-    co_than = st.slider("Cước xe Than (Triệu):", min_value=5, max_value=50, value=15) * 1000000
+
+    co_than = (
+        st.slider(
+            "Cước xe Than (Triệu):",
+            min_value=5,
+            max_value=50,
+            value=15
+        )
+        * 1000000
+    )
     ch_than, imax_than = 25000, 50000
 
 with st.sidebar.expander("🔥 2. KHO CHẤT ĐỐT", expanded=False):
-    i0_cd = st.number_input("Tồn kho C.Đốt (I_0):", min_value=0, max_value=20000, value=1000, step=200)
-    lt_cd = st.slider("Thời gian chờ (Lead Time) - Ngày:", min_value=0, max_value=5, value=1)
-    co_cd = st.slider("Cước xe C.Đốt (Triệu):", min_value=2, max_value=30, value=8) * 1000000
+    i0_cd = st.number_input(
+        "Tồn kho C.Đốt (I_0):",
+        min_value=0,
+        max_value=20000,
+        value=1000,
+        step=200
+    )
+    lt_cd = st.slider(
+        "Thời gian chờ (Lead Time) - Ngày:",
+        min_value=0,
+        max_value=5,
+        value=1
+    )
+    co_cd = (
+        st.slider(
+            "Cước xe C.Đốt (Triệu):",
+            min_value=2,
+            max_value=30,
+            value=8
+        )
+        * 1000000
+    )
     ch_cd, imax_cd = 15000, 20000
 
 with st.sidebar.expander("🪨 3. KHO CARBON", expanded=False):
-    i0_cb = st.number_input("Tồn kho Carbon (I_0):", min_value=0, max_value=5000, value=100, step=50)
-    lt_cb = st.slider("Thời gian chờ (Lead Time) C.B - Ngày:", min_value=0, max_value=5, value=0)
-    co_cb = st.slider("Cước xe Carbon (Triệu):", min_value=1, max_value=20, value=5) * 1000000
+    i0_cb = st.number_input(
+        "Tồn kho Carbon (I_0):",
+        min_value=0,
+        max_value=5000,
+        value=100,
+        step=50
+    )
+    lt_cb = st.slider(
+        "Thời gian chờ (Lead Time) C.B - Ngày:",
+        min_value=0,
+        max_value=5,
+        value=0
+    )
+    co_cb = (
+        st.slider(
+            "Cước xe Carbon (Triệu):",
+            min_value=1,
+            max_value=20,
+            value=5
+        )
+        * 1000000
+    )
     ch_cb, imax_cb = 40000, 5000
 
+
 # ==========================================
-# 4. GIAO DIỆN CHÍNH: LỚP 1.5 - AI THỜI TIẾT
+# 4. WEATHER + AI RISK, LUÔN GIỮ CÙNG HORIZON
 # ==========================================
 st.subheader("🌤️ 1. Dữ liệu Thời tiết & AI Dự báo Rủi ro")
 
-col_btn, col_info = st.columns([1, 4])
-with col_btn:
-    if st.button("📡 Quét Thời Tiết Thực Tế (Hạ Long)", use_container_width=True):
-        with st.spinner("Đang kết nối vệ tinh..."):
-            real_df = fetch_api_weather()
-            if real_df is not None:
-                st.session_state.weather_data = real_df 
-                st.success("Tải dữ liệu thực tế thành công!")
-with col_info:
-    st.info("💡 Điểm rủi ro cao sẽ tự động **Cộng thêm số ngày trễ (Delay)** vào Thời gian giao hàng (Lead Time) của bạn.")
+expected_date_strings = display_dates
 
-edited_weather = st.data_editor(st.session_state.weather_data, num_rows="fixed", use_container_width=True)
+if "weather_data" not in st.session_state:
+    st.session_state.weather_data = weather_to_ui_frame(df_weather)
+else:
+    session_dates = (
+        st.session_state.weather_data.get("Ngày", pd.Series(dtype=str))
+        .astype(str)
+        .tolist()
+    )
+    if session_dates != expected_date_strings:
+        # Demand horizon đã đổi sau một lần chạy pipeline mới:
+        # reset weather session để không giữ dữ liệu từ horizon cũ.
+        st.session_state.weather_data = weather_to_ui_frame(df_weather)
+
+col_btn, col_info = st.columns([1, 4])
+
+with col_btn:
+    if st.button(
+        "📡 Làm mới Thời Tiết (Hạ Long)",
+        use_container_width=True
+    ):
+        with st.spinner("Đang tải weather cho đúng Decision Horizon..."):
+            refreshed = get_real_weather_7_days(
+                forecast_dates=forecast_dates,
+                save_path=WEATHER_FILE
+            )
+
+            if refreshed is None:
+                st.error(
+                    "Không cập nhật weather vì API không trả đủ đúng "
+                    "7 ngày của Decision Horizon."
+                )
+            else:
+                refreshed_dates = refreshed["Ngay"].astype(str).tolist()
+
+                if refreshed_dates != expected_date_strings:
+                    st.error(
+                        "Weather mới không khớp Demand Horizon. "
+                        "Dữ liệu cũ được giữ nguyên."
+                    )
+                else:
+                    st.session_state.weather_data = weather_to_ui_frame(
+                        refreshed
+                    )
+                    st.success(
+                        "Weather đã được làm mới và vẫn khớp 1:1 "
+                        "với Demand Horizon."
+                    )
+
+with col_info:
+    st.info(
+        "💡 Ngày trong bảng bị khóa. Bạn có thể chỉnh các biến thời tiết "
+        "để chạy kịch bản, nhưng Risk/Fuzzy/MILP luôn giữ nguyên "
+        "7 ngày của Demand Forecast."
+    )
+
+edited_weather = st.data_editor(
+    st.session_state.weather_data,
+    num_rows="fixed",
+    disabled=["Ngày"],
+    use_container_width=True
+)
+
+if edited_weather["Ngày"].astype(str).tolist() != expected_date_strings:
+    st.error("❌ Weather horizon đã bị thay đổi ngoài ý muốn.")
+    st.stop()
 
 X_predict = pd.DataFrame({
-    'Nhiet_Do_C': edited_weather['Nhiệt Độ (C)'],
-    'Luong_Mua_mm': edited_weather['Lượng Mưa (mm)'],
-    'Suc_Gio_kmh': edited_weather['Sức Gió (km/h)'],
-    'Bao': edited_weather['Có Bão (1/0)']
+    "Nhiet_Do_C": pd.to_numeric(
+        edited_weather["Nhiệt Độ (C)"],
+        errors="coerce"
+    ),
+    "Luong_Mua_mm": pd.to_numeric(
+        edited_weather["Lượng Mưa (mm)"],
+        errors="coerce"
+    ),
+    "Suc_Gio_kmh": pd.to_numeric(
+        edited_weather["Sức Gió (km/h)"],
+        errors="coerce"
+    ),
+    "Bao": pd.to_numeric(
+        edited_weather["Có Bão (1/0)"],
+        errors="coerce"
+    ),
 })
+
+if X_predict.isna().any().any():
+    st.error("❌ Weather scenario có giá trị không hợp lệ.")
+    st.stop()
 
 dynamic_risk_scores = weather_ai.predict(X_predict)
 
 cols = st.columns(7)
 for i, col in enumerate(cols):
     risk_val = dynamic_risk_scores[i]
-    color = "#d63031" if risk_val >= 7 else "#fdcb6e" if risk_val >= 4 else "#00b894"
-    col.markdown(f"<div style='text-align: center; padding: 10px; background-color: #f1f2f6; border-radius: 5px; border-bottom: 5px solid {color};'>"
-                 f"<b>Ngày {i+1}</b><br><h3 style='margin:0; color:{color}'>{risk_val:.1f}</h3></div>", 
-                 unsafe_allow_html=True)
+    color = (
+        "#d63031"
+        if risk_val >= 7
+        else "#fdcb6e"
+        if risk_val >= 4
+        else "#00b894"
+    )
+
+    short_date = pd.Timestamp(forecast_dates[i]).strftime("%d/%m")
+    col.markdown(
+        "<div style='text-align: center; padding: 10px; "
+        "background-color: #f1f2f6; border-radius: 5px; "
+        f"border-bottom: 5px solid {color};'>"
+        f"<b>{short_date}</b><br>"
+        f"<h3 style='margin:0; color:{color}'>{risk_val:.1f}</h3>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
 st.markdown("---")
 
+
 # ==========================================
-# 5. CHẠY LỚP 2 & LỚP 3 VỚI RỦI RO VÀ LEAD TIME ĐỘNG
+# 5. FUZZY + MILP TRÊN CÙNG 7 NGÀY
 # ==========================================
 fuzzy_sim = build_fuzzy_system_thesis(visualize=False)
 
+
 def calculate_dynamic_isafe(dt_list, max_cap):
     isafe_list = []
+
     for dt, risk in zip(dt_list, dynamic_risk_scores):
         if dt == 0:
             isafe_list.append(0)
         else:
-            demand_pct = min(100, max(0, (dt / max_cap) * 100))
-            fuzzy_sim.input['Demand'] = demand_pct
-            fuzzy_sim.input['Risk'] = min(10.0, risk)
+            demand_pct = min(
+                100,
+                max(0, (dt / max_cap) * 100)
+            )
+            fuzzy_sim.input["Demand"] = demand_pct
+            fuzzy_sim.input["Risk"] = min(10.0, float(risk))
             fuzzy_sim.compute()
-            isafe_list.append(dt * fuzzy_sim.output['Safety_Days'])
+
+            isafe_list.append(
+                dt * fuzzy_sim.output["Safety_Days"]
+            )
+
     return isafe_list
 
-# Tính an toàn động (Lớp 2) - Nạp nhu cầu thực tế
+
 isafe_than = calculate_dynamic_isafe(dt_than_actual, 1000.0)
 isafe_cd = calculate_dynamic_isafe(dt_cd_actual, 500.0)
 isafe_cb = calculate_dynamic_isafe(dt_cb_actual, 200.0)
 
-# Chạy Tối ưu MILP (Lớp 3) - Nạp nhu cầu thực tế
-res_than = solve_milp_single_material("Than", dt_than_actual, isafe_than, i0_than, co_than, ch_than, imax_than, base_lead_time=lt_than, risk_scores=dynamic_risk_scores)
-res_cd = solve_milp_single_material("ChatDot", dt_cd_actual, isafe_cd, i0_cd, co_cd, ch_cd, imax_cd, base_lead_time=lt_cd, risk_scores=dynamic_risk_scores)
-res_cb = solve_milp_single_material("Carbon", dt_cb_actual, isafe_cb, i0_cb, co_cb, ch_cb, imax_cb, base_lead_time=lt_cb, risk_scores=dynamic_risk_scores)
+res_than = solve_milp_single_material(
+    "Than",
+    dt_than_actual,
+    isafe_than,
+    i0_than,
+    co_than,
+    ch_than,
+    imax_than,
+    base_lead_time=lt_than,
+    risk_scores=dynamic_risk_scores
+)
+res_cd = solve_milp_single_material(
+    "ChatDot",
+    dt_cd_actual,
+    isafe_cd,
+    i0_cd,
+    co_cd,
+    ch_cd,
+    imax_cd,
+    base_lead_time=lt_cd,
+    risk_scores=dynamic_risk_scores
+)
+res_cb = solve_milp_single_material(
+    "Carbon",
+    dt_cb_actual,
+    isafe_cb,
+    i0_cb,
+    co_cb,
+    ch_cb,
+    imax_cb,
+    base_lead_time=lt_cb,
+    risk_scores=dynamic_risk_scores
+)
+
 
 # ==========================================
-# 6. HIỂN THỊ KẾT QUẢ QUYẾT ĐỊNH (CẬP NHẬT 7 BIẾN)
+# 6. HIỂN THỊ KẾT QUẢ QUYẾT ĐỊNH
 # ==========================================
-total_system_cost = sum([res[1] for res in [res_than, res_cd, res_cb] if res[0]])
-st.subheader(f"🏆 2. KẾT QUẢ TỐI ƯU HÓA (ĐÃ TÍNH TRỄ HÀNG): {total_system_cost:,.0f} VNĐ")
+total_system_cost = sum(
+    res[1]
+    for res in [res_than, res_cd, res_cb]
+    if res[0]
+)
 
-# Nếu tổng chi phí > 1 Tỷ, cảnh báo đứt gãy chuỗi cung ứng
+st.subheader(
+    "🏆 2. KẾT QUẢ TỐI ƯU HÓA "
+    f"(ĐÃ TÍNH TRỄ HÀNG): {total_system_cost:,.0f} VNĐ"
+)
+
 if total_system_cost >= 1e9:
-    st.error("🚨 **BÁO ĐỘNG ĐỎ:** Hệ thống không thể nhập đủ hàng. Tồn đầu kỳ quá thấp so với thời gian chờ (Lead Time) hoặc có Siêu Bão làm đứt gãy chuỗi cung ứng. Nhà máy sẽ bị thiếu nguyên liệu!")
+    st.error(
+        "🚨 **BÁO ĐỘNG ĐỎ:** Hệ thống không thể nhập đủ hàng. "
+        "Tồn đầu kỳ quá thấp so với thời gian chờ (Lead Time) "
+        "hoặc có thời tiết rủi ro cao làm đứt gãy chuỗi cung ứng."
+    )
 
-tab1, tab2, tab3 = st.tabs(["⚫ Kịch bản: THAN", "🔥 Kịch bản: CHẤT ĐỐT", "🪨 Kịch bản: CARBON"])
+tab1, tab2, tab3 = st.tabs([
+    "⚫ Kịch bản: THAN",
+    "🔥 Kịch bản: CHẤT ĐỐT",
+    "🪨 Kịch bản: CARBON"
+])
 
-# Lấy trục thời gian hiển thị ĐỘNG từ bảng thời tiết (API quyết định ngày nào)
-current_display_dates = st.session_state.weather_data['Ngày'].tolist()
 
-# ... (Khối code tính toán MILP giữ nguyên) ...
-
-# Truyền thêm current_display_dates vào hàm render_tab
-def render_tab(tab, name, res_data, dt, isafe, risk_arr, display_dates):
+def render_tab(tab, name, res_data, dt, isafe, risk_arr, dates):
     with tab:
-        success, cost, orders, Q_vals, I_vals, R_vals, L_vals = res_data
+        success, cost, orders, q_vals, i_vals, r_vals, l_vals = res_data
+
         if not success:
-            st.error(f"⚠️ Hệ thống MILP của {name} bị sập (Infeasible).")
+            st.error(
+                f"⚠️ Hệ thống MILP của {name} bị Infeasible."
+            )
             return
-            
+
         c1, c2, c3 = st.columns(3)
-        c1.metric(f"Tổng Chi Phí", f"{(cost % 1e9):,.0f} đ" if cost < 1e9 else "RẤT LỚN (Phạt thiếu hàng)")
-        c2.metric("Số Lần Gọi Điện", f"{orders:,.0f} chuyến")
-        c3.metric("Số Lần Hàng Tới Bến", f"{sum(1 for r in R_vals if r > 0)} chuyến")
-        
-        # Bảng dữ liệu dùng thời gian thực
+        c1.metric(
+            "Tổng Chi Phí",
+            (
+                f"{(cost % 1e9):,.0f} đ"
+                if cost < 1e9
+                else "RẤT LỚN (Phạt thiếu hàng)"
+            )
+        )
+        c2.metric(
+            "Số Lần Gọi Điện",
+            f"{orders:,.0f} chuyến"
+        )
+        c3.metric(
+            "Số Lần Hàng Tới Bến",
+            f"{sum(1 for r in r_vals if r > 0)} chuyến"
+        )
+
         df_plot = pd.DataFrame({
-            'Ngày': display_dates, 
-            'Thời Tiết (Rủi ro)': np.round(risk_arr, 1),
-            'Chờ Hàng ($L_t$)': [f"{int(l)} ngày" for l in L_vals],
-            'Lệnh GỌI MUA ($Q_t$)': Q_vals,
-            'Hàng CẬP BẾN ($R_t$)': R_vals,
-            'Tồn Thực Tế ($I_t$)': I_vals
+            "Ngày": dates,
+            "Nhu Cầu ($D_t$)": dt,
+            "Thời Tiết (Rủi ro)": np.round(risk_arr, 1),
+            "Chờ Hàng ($L_t$)": [
+                f"{int(value)} ngày"
+                for value in l_vals
+            ],
+            "Lệnh GỌI MUA ($Q_t$)": q_vals,
+            "Hàng CẬP BẾN ($R_t$)": r_vals,
+            "Tồn Thực Tế ($I_t$)": i_vals,
         })
-        st.dataframe(df_plot.style.format("{:.1f}", subset=['Thời Tiết (Rủi ro)', 'Lệnh GỌI MUA ($Q_t$)', 'Hàng CẬP BẾN ($R_t$)', 'Tồn Thực Tế ($I_t$)']), use_container_width=True)
-        
-        # Biểu đồ Vận hành Kho dùng thời gian thực
+
+        st.dataframe(
+            df_plot.style.format(
+                "{:.1f}",
+                subset=[
+                    "Nhu Cầu ($D_t$)",
+                    "Thời Tiết (Rủi ro)",
+                    "Lệnh GỌI MUA ($Q_t$)",
+                    "Hàng CẬP BẾN ($R_t$)",
+                    "Tồn Thực Tế ($I_t$)",
+                ]
+            ),
+            use_container_width=True
+        )
+
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(display_dates, I_vals, marker='o', color='blue', linewidth=2, label='Tồn kho thực tế ($I_t$)')
-        ax.plot(display_dates, isafe, linestyle='--', color='red', linewidth=2, label='Đường an toàn ($I_{safe}$)')
-        
+
+        ax.plot(
+            dates,
+            i_vals,
+            marker="o",
+            color="blue",
+            linewidth=2,
+            label="Tồn kho thực tế ($I_t$)"
+        )
+        ax.plot(
+            dates,
+            isafe,
+            linestyle="--",
+            color="red",
+            linewidth=2,
+            label="Đường an toàn ($I_{safe}$)"
+        )
+
         ax2 = ax.twinx()
         width = 0.35
-        x = np.arange(len(display_dates))
-        
-        ax2.bar(x - width/2, Q_vals, width, alpha=0.6, color='orange', label='📞 Lệnh Đặt Mua ($Q_t$)')
-        ax2.bar(x + width/2, R_vals, width, alpha=0.6, color='green', label='🚢 Tàu Cập Bến ($R_t$)')
-        
+        x = np.arange(len(dates))
+
+        ax2.bar(
+            x - width / 2,
+            q_vals,
+            width,
+            alpha=0.6,
+            color="orange",
+            label="📞 Lệnh Đặt Mua ($Q_t$)"
+        )
+        ax2.bar(
+            x + width / 2,
+            r_vals,
+            width,
+            alpha=0.6,
+            color="green",
+            label="🚢 Tàu Cập Bến ($R_t$)"
+        )
+
         ax2.set_xticks(x)
-        ax2.set_xticklabels(display_dates)
+        ax2.set_xticklabels(dates, rotation=30, ha="right")
         ax.set_ylabel("Khối lượng Tồn (Tấn)")
         ax2.set_ylabel("Khối lượng Giao Dịch (Tấn)")
-        ax.set_title(f"MÔ PHỎNG LỊCH TRÌNH ĐẶT HÀNG TRƯỚC (DYNAMIC LEAD TIME) - {name.upper()}", fontweight='bold')
-        
+        ax.set_title(
+            "MÔ PHỎNG LỊCH TRÌNH ĐẶT HÀNG TRƯỚC "
+            f"(DYNAMIC LEAD TIME) - {name.upper()}",
+            fontweight="bold"
+        )
+
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines + lines2, labels + labels2, loc='upper left')
-        
-        st.pyplot(fig)
+        ax.legend(
+            lines + lines2,
+            labels + labels2,
+            loc="upper left"
+        )
 
-# Gọi hàm với tham số mới
-render_tab(tab1, "Than", res_than, dt_than_actual, isafe_than, dynamic_risk_scores, current_display_dates)
-render_tab(tab2, "Chất Đốt", res_cd, dt_cd_actual, isafe_cd, dynamic_risk_scores, current_display_dates)
-render_tab(tab3, "Carbon", res_cb, dt_cb_actual, isafe_cb, dynamic_risk_scores, current_display_dates)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+
+render_tab(
+    tab1,
+    "Than",
+    res_than,
+    dt_than_actual,
+    isafe_than,
+    dynamic_risk_scores,
+    display_dates
+)
+render_tab(
+    tab2,
+    "Chất Đốt",
+    res_cd,
+    dt_cd_actual,
+    isafe_cd,
+    dynamic_risk_scores,
+    display_dates
+)
+render_tab(
+    tab3,
+    "Carbon",
+    res_cb,
+    dt_cb_actual,
+    isafe_cb,
+    dynamic_risk_scores,
+    display_dates
+)
