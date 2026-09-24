@@ -1,0 +1,8 @@
+{
+  "generated_at": "2026-09-24T15:24:05.806946+07:00",
+  "timezone": "Asia/Ho_Chi_Minh",
+  "forecast_start": "2026-09-24",
+  "forecast_end": "2026-09-30",
+  "forecast_days": 7,
+  "allow_stale_demand_data": true
+}
